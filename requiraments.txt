@@ -1,0 +1,5 @@
+requests>=2.31.0
+pandas>=1.5.3
+plotly>=5.15.0
+scikit-learn>=1.2.2
+streamlit
