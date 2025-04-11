@@ -1,137 +1,187 @@
+import streamlit as st
 import requests
 import pandas as pd
-import streamlit as st
+import numpy as np
+from datetime import datetime
 import plotly.express as px
-import plotly.graph_objects as go
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error
+import folium
+from streamlit_folium import folium_static
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
-# Set Page Configuration
-st.set_page_config(page_title="Weather & Air Quality", page_icon="🌤️", layout="wide")
+# ============ API Key ============
+API_KEY = "d14a4f432f95fbcc237c73076e774343"
 
-# Custom CSS for Better UI
-st.markdown("""
-    <style>
-    .metric-container {
-        text-align: center;
-        font-size: 20px;
-        font-weight: bold;
-        padding: 10px;
-        border-radius: 10px;
-        background-color: #1e1e1e;
-        color: white;
-        box-shadow: 3px 3px 10px rgba(255,255,255,0.1);
-    }
-    </style>
-""", unsafe_allow_html=True)
+# ============ LSTM Helper Functions ============
 
-# API Key (Replace with your actual OpenWeather API key)
-API_KEY = 'd14a4f432f95fbcc237c73076e774343'
+def prepare_data(df, steps=3):
+    df_scaled = scaler.fit_transform(df)
+    X, y = [], []
+    for i in range(len(df_scaled) - steps):
+        X.append(df_scaled[i:i+steps])
+        y.append(df_scaled[i+steps])
+    return np.array(X), np.array(y)
 
-# Function to get city coordinates
-def get_city_coordinates(city_name):
-    url = f'http://api.openweathermap.org/data/2.5/weather?q={city_name}&appid={API_KEY}'
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        return data['coord']['lat'], data['coord']['lon']
-    except:
-        st.error("Invalid city name or API issue!")
-        return None, None
+@st.cache_resource
+def train_lstm_model(past_df):
+    global scaler
+    scaler = MinMaxScaler()
+    X, y = prepare_data(past_df[['pm2_5', 'pm10', 'so2', 'no2']])
 
-# Function to get weather data
-def get_weather_data(lat, lon):
-    url = f'http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric'
-    response = requests.get(url).json()
+    model = Sequential()
+    model.add(LSTM(64, activation='relu', input_shape=(X.shape[1], X.shape[2])))
+    model.add(Dense(4))
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=20, verbose=0)
+    return model, scaler
+
+def predict_future(model, past_df, steps=4):
+    data = scaler.transform(past_df[['pm2_5', 'pm10', 'so2', 'no2']])
+    predictions = []
+
+    input_seq = data[-3:].copy()
+    for _ in range(steps):
+        input_seq_reshaped = np.expand_dims(input_seq, axis=0)
+        pred = model.predict(input_seq_reshaped, verbose=0)[0]
+        predictions.append(pred)
+        input_seq = np.vstack([input_seq[1:], pred])
+    
+    predictions = scaler.inverse_transform(predictions)
+    dates = pd.date_range(datetime.now(), periods=steps).date
+    return pd.DataFrame(predictions, columns=["pm2_5", "pm10", "so2", "no2"], index=dates)
+
+# ============ API Functions ============
+
+def get_coordinates(city):
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={API_KEY}"
+    res = requests.get(url).json()
+    return (res['coord']['lat'], res['coord']['lon']) if 'coord' in res else (None, None)
+
+def get_current_weather(lat, lon):
+    url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&units=metric&appid={API_KEY}"
+    res = requests.get(url).json()
     return {
-        'temperature': response['main']['temp'],
-        'humidity': response['main']['humidity'],
-        'pressure': response['main']['pressure'],
-        'weather': response['weather'][0]['description'],
-        'wind_speed': response['wind']['speed'],
-        'wind_deg': response['wind'].get('deg', None),
-        'icon': response['weather'][0]['icon']
+        "temp": res['main']['temp'],
+        "humidity": res['main']['humidity'],
+        "wind_speed": res['wind']['speed'],
+        "wind_deg": res['wind']['deg']
     }
 
-# Function to get air quality data
-def get_hourly_air_quality(lat, lon):
-    url = f'http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={API_KEY}'
-    response = requests.get(url).json()
-    hourly_data = []
-    for hour in response['list']:
-        timestamp = hour['dt']
-        datetime = pd.to_datetime(timestamp, unit='s', utc=True)
-        air_quality = hour['components']
-        hourly_data.append({
-            'datetime': datetime,
-            'pm2_5': air_quality.get('pm2_5', None),
-            'pm10': air_quality.get('pm10', None),
-            'co': air_quality.get('co', None),
-            'no2': air_quality.get('no2', None),
-            'so2': air_quality.get('so2', None),
-            'o3': air_quality.get('o3', None),
-        })
-    return hourly_data
+def get_air_quality(lat, lon):
+    url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={API_KEY}"
+    res = requests.get(url).json()
+    return pd.DataFrame([{
+        "datetime": pd.to_datetime(i['dt'], unit='s'),
+        "pm2_5": i['components']['pm2_5'],
+        "pm10": i['components']['pm10'],
+        "so2": i['components']['so2'],
+        "no2": i['components']['no2']
+    } for i in res.get('list', [])])
 
-# Function to predict PM2.5
-def predict_pm2_5(df):
-    df = df.dropna()
-    if len(df) < 10:
-        return None, None, None
-    
-    X = df[['pm10', 'co', 'no2', 'so2', 'o3']]
-    y = df['pm2_5']
-    
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = RandomForestRegressor(n_estimators=100, random_state=42)
-    model.fit(X_train, y_train)
-    
-    predictions = model.predict(X_test)
-    mae = mean_absolute_error(y_test, predictions)
-    
-    future_data = X.tail(5).copy()
-    future_data.index = pd.date_range(start=df['datetime'].max(), periods=5, freq='H')
-    future_predictions = model.predict(future_data)
+def deg_to_direction(deg):
+    dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+    return dirs[round(deg / 45) % 8]
 
-    return future_data.index, future_predictions, mae
+# ============ Health Advice & Chatbot ============
 
-# UI Section
-st.title("🌤️ Weather & Air Quality Dashboard")
-st.subheader("Get real-time air quality, weather updates, and PM2.5 predictions 📊")
+def get_suggestions(condition, pm2_5):
+    if pm2_5 <= 12:
+        status = "Good"
+    elif pm2_5 <= 35:
+        status = "Moderate"
+    elif pm2_5 <= 55:
+        status = "Unhealthy for Sensitive Groups"
+    elif pm2_5 <= 150:
+        status = "Unhealthy"
+    else:
+        status = "Very Unhealthy"
 
-city_name = st.text_input("🏙️ Enter City Name:", "")
-if city_name:
-    with st.spinner(f"Fetching data for {city_name}..."):
-        lat, lon = get_city_coordinates(city_name)
-        if lat is not None and lon is not None:
-            air_quality_data = get_hourly_air_quality(lat, lon)
-            weather_data = get_weather_data(lat, lon)
-            
-            if air_quality_data and weather_data:
-                df = pd.DataFrame(air_quality_data)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader(f"🌍 Weather in {city_name}")
-                    st.image(f"http://openweathermap.org/img/wn/{weather_data['icon']}@2x.png", width=80)
-                    st.markdown(f"<div class='metric-container'>🌡️ Temperature: {weather_data['temperature']}°C</div>", unsafe_allow_html=True)
-                    st.markdown(f"<div class='metric-container'>💧 Humidity: {weather_data['humidity']}%</div>", unsafe_allow_html=True)
-                    st.markdown(f"<div class='metric-container'>🌬️ Wind Speed: {weather_data['wind_speed']} m/s</div>", unsafe_allow_html=True)
-                
-                with col2:
-                    st.subheader(f"🛑 Air Quality in {city_name}")
-                    fig_air_quality = px.line(df, x='datetime', y=['pm2_5', 'pm10', 'co', 'no2', 'so2', 'o3'], title='Air Quality Over Time')
-                    st.plotly_chart(fig_air_quality, use_container_width=True)
-                    
-                future_times, future_pm2_5, mae = predict_pm2_5(df)
-                if future_pm2_5 is not None:
-                    st.markdown(f"<div class='metric-container'>📊 Mean Absolute Error (MAE): {round(mae, 2)}</div>", unsafe_allow_html=True)
-                    future_fig = go.Figure()
-                    future_fig.add_trace(go.Scatter(x=future_times, y=future_pm2_5, mode='lines+markers', name='Predicted PM2.5'))
-                    future_fig.update_layout(title="📈 Predicted PM2.5 for Next Hours", xaxis_title="Time", yaxis_title="PM2.5 Level")
-                    st.plotly_chart(future_fig, use_container_width=True)
+    recs = {
+        "Asthma": "Carry inhaler, avoid exertion, wear a mask.",
+        "Heart Disease": "Avoid exercise, stay indoors, wear a mask.",
+        "Children": "Keep indoors, avoid outdoor play.",
+        "Elderly": "Stay hydrated and indoors, wear a mask.",
+        "Healthy": "Wear a mask on poor AQI days."
+    }
+    return status, recs.get(condition, "Avoid pollution exposure.")
+
+def chatbot_response(msg, condition, pm2_5):
+    msg = msg.lower()
+    base = "✅ Air is okay." if pm2_5 <= 35 else (
+        "⚠️ Moderate air. Sensitive groups, be cautious." if pm2_5 <= 55 else "🚫 Unhealthy air. Avoid going out.")
+
+    recs = {
+        "Asthma": "Use inhaler, stay indoors, wear a mask.",
+        "Heart Disease": "Avoid exertion outdoors, stay cool, wear a mask.",
+        "Children": "Limit outdoor activity.",
+        "Elderly": "Avoid pollution and stay hydrated.",
+        "Healthy": "Use mask and avoid long outdoor exposure."
+    }
+
+    if any(k in msg for k in ["hi", "hello", "hey"]):
+        return f"👋 Hello! I'm your air quality bot. You selected '{condition}'. Ask away!"
+
+    if any(k in msg for k in ["safe", "okay", "go out"]):
+        return f"{base} Advice for {condition}: {recs.get(condition)}"
+
+    if any(k in msg for k in ["precaution", "do", "mask"]):
+        return f"😷 For {condition}: {recs.get(condition)}"
+
+    return "🤖 Ask if it's safe to go out, or what precautions to take!"
+
+# ============ Streamlit App ============
+
+st.set_page_config("🌤️ Air Quality & Weather Advisor", layout="wide")
+st.title("🌍 Smart Air Quality & Weather Assistant")
+
+city = st.text_input("Enter a city name:")
+health_condition = st.selectbox("Select your health condition:", ["Healthy", "Asthma", "Heart Disease", "Children", "Elderly"])
+
+if city:
+    lat, lon = get_coordinates(city)
+    if lat:
+        st.subheader("🌡️ Current Weather & 🗺️ City Map")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            weather = get_current_weather(lat, lon)
+            st.metric("Temperature (°C)", weather["temp"])
+            st.metric("Humidity (%)", weather["humidity"])
+            st.metric("Wind Speed (m/s)", weather["wind_speed"])
+            st.metric("Wind Direction", deg_to_direction(weather["wind_deg"]))
+
+        with col2:
+            m = folium.Map(location=[lat, lon], zoom_start=11)
+            folium.Marker([lat, lon], tooltip=city).add_to(m)
+            folium_static(m)
+
+        st.subheader("📊 AQI Forecast (PM2.5, PM10, SO₂, NO₂)")
+        aqi_df = get_air_quality(lat, lon)
+        if not aqi_df.empty:
+            aqi_df = aqi_df.set_index("datetime").resample("D").mean().reset_index()
+            past_df = aqi_df.tail(7).copy()
+
+            st.markdown("### 🔮 LSTM-based AQI Forecast")
+            model, scaler = train_lstm_model(past_df)
+            future_df = predict_future(model, past_df)
+
+            full_df = pd.concat([past_df.set_index("datetime")[["pm2_5", "pm10", "so2", "no2"]],
+                                 future_df.rename_axis("datetime")])
+            fig = px.line(full_df, x=full_df.index, y=full_df.columns, title="Predicted AQI (μg/m³)")
+            st.plotly_chart(fig, use_container_width=True)
+
+            latest_pm2_5 = future_df.iloc[0]['pm2_5']
+            status, message = get_suggestions(health_condition, latest_pm2_5)
+            st.success(f"**Predicted Air Quality:** {status}\n\n**Advice for {health_condition}:** {message}")
+
+        st.subheader("🤖 Chatbot Assistant")
+        st.markdown("Ask me something like:\n- Is it safe to go outside today?\n- What precautions should I take?\n- Do I need a mask?")
+        user_msg = st.text_input("Your question:")
+        if user_msg:
+            st.write(chatbot_response(user_msg, health_condition, latest_pm2_5))
+
+
 
 
 
