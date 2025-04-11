@@ -6,35 +6,17 @@ from datetime import datetime
 import plotly.express as px
 import folium
 from streamlit_folium import folium_static
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.models import load_model
+import joblib
 
 # ============ API Key ============
 API_KEY = "d14a4f432f95fbcc237c73076e774343"
 
-# ============ LSTM Helper Functions ============
+# ============ Load Pre-trained Model ============
+model = load_model("aqi_lstm_model.h5")
+scaler = joblib.load("scaler.pkl")
 
-def prepare_data(df, steps=3):
-    df_scaled = scaler.fit_transform(df)
-    X, y = [], []
-    for i in range(len(df_scaled) - steps):
-        X.append(df_scaled[i:i+steps])
-        y.append(df_scaled[i+steps])
-    return np.array(X), np.array(y)
-
-@st.cache_resource
-def train_lstm_model(past_df):
-    global scaler
-    scaler = MinMaxScaler()
-    X, y = prepare_data(past_df[['pm2_5', 'pm10', 'so2', 'no2']])
-
-    model = Sequential()
-    model.add(LSTM(64, activation='relu', input_shape=(X.shape[1], X.shape[2])))
-    model.add(Dense(4))
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(X, y, epochs=20, verbose=0)
-    return model, scaler
+# ============ LSTM Prediction Function ============
 
 def predict_future(model, past_df, steps=4):
     data = scaler.transform(past_df[['pm2_5', 'pm10', 'so2', 'no2']])
@@ -163,11 +145,12 @@ if city:
             past_df = aqi_df.tail(7).copy()
 
             st.markdown("### 🔮 LSTM-based AQI Forecast")
-            model, scaler = train_lstm_model(past_df)
             future_df = predict_future(model, past_df)
 
-            full_df = pd.concat([past_df.set_index("datetime")[["pm2_5", "pm10", "so2", "no2"]],
-                                 future_df.rename_axis("datetime")])
+            full_df = pd.concat([
+                past_df.set_index("datetime")[["pm2_5", "pm10", "so2", "no2"]],
+                future_df.rename_axis("datetime")
+            ])
             fig = px.line(full_df, x=full_df.index, y=full_df.columns, title="Predicted AQI (μg/m³)")
             st.plotly_chart(fig, use_container_width=True)
 
