@@ -8,53 +8,56 @@ import plotly.express as px
 import folium
 from streamlit_folium import folium_static
 from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import load_model
-import joblib
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
 
 # ===== API Key for OpenWeatherMap =====
 API_KEY = "d14a4f432f95fbcc237c73076e774343"
 
-# ===== Load Pre-trained Model & Scaler =====
+# ===== Page Setup =====
+st.set_page_config("🌤️ Air Quality & Weather Advisor", layout="wide")
+st.title("🌍 Smart Air Quality & Weather Assistant")
+
+# ======= LSTM Helper Functions =======
+def prepare_data(df, steps=3):
+    df_scaled = scaler.fit_transform(df)
+    X, y = [], []
+    for i in range(len(df_scaled) - steps):
+        X.append(df_scaled[i:i+steps])
+        y.append(df_scaled[i+steps])
+    return np.array(X), np.array(y)
+
 @st.cache_resource
-def load_lstm_model():
-    model = load_model("lstm_aqi_model.h5")
-    scaler = joblib.load("scaler.pkl")
+def train_lstm_model(past_df):
+    global scaler
+    scaler = MinMaxScaler()
+    X, y = prepare_data(past_df[['pm2_5', 'pm10', 'so2', 'no2']])
+    model = Sequential()
+    model.add(LSTM(64, activation='relu', input_shape=(X.shape[1], X.shape[2])))
+    model.add(Dense(4))
+    model.compile(optimizer='adam', loss='mse')
+    model.fit(X, y, epochs=20, verbose=0)
     return model, scaler
 
-try:
-    model, scaler = load_lstm_model()
-    model_loaded = True
-except:
-    st.warning("⚠️ Model not found! Using fallback prediction method.")
-    model_loaded = False
-
-# ===== Prediction Functions =====
-def predict_future(past_df, steps=4):
+def predict_future(model, past_df, steps=4):
     data = scaler.transform(past_df[['pm2_5', 'pm10', 'so2', 'no2']])
     predictions = []
     input_seq = data[-3:].copy()
     for _ in range(steps):
-        pred = model.predict(np.expand_dims(input_seq, axis=0), verbose=0)[0]
+        input_seq_reshaped = np.expand_dims(input_seq, axis=0)
+        pred = model.predict(input_seq_reshaped, verbose=0)[0]
         predictions.append(pred)
         input_seq = np.vstack([input_seq[1:], pred])
     predictions = scaler.inverse_transform(predictions)
     dates = pd.date_range(datetime.now(), periods=steps).date
     return pd.DataFrame(predictions, columns=["pm2_5", "pm10", "so2", "no2"], index=dates)
 
-def predict_future_fallback(past_df, steps=4):
-    last_values = past_df[["pm2_5", "pm10", "so2", "no2"]].iloc[-1].values
-    predictions = [last_values] * steps
-    dates = pd.date_range(datetime.now(), periods=steps).date
-    return pd.DataFrame(predictions, columns=["pm2_5", "pm10", "so2", "no2"], index=dates)
-
-# ===== API Functions =====
-@st.cache_data
+# ======= API Functions =======
 def get_coordinates(city):
     url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={API_KEY}"
     res = requests.get(url).json()
     return (res['coord']['lat'], res['coord']['lon']) if 'coord' in res else (None, None)
 
-@st.cache_data
 def get_current_weather(lat, lon):
     url = f"http://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&units=metric&appid={API_KEY}"
     res = requests.get(url).json()
@@ -65,7 +68,6 @@ def get_current_weather(lat, lon):
         "wind_deg": res['wind']['deg']
     }
 
-@st.cache_data
 def get_air_quality(lat, lon):
     url = f"http://api.openweathermap.org/data/2.5/air_pollution/forecast?lat={lat}&lon={lon}&appid={API_KEY}"
     res = requests.get(url).json()
@@ -81,14 +83,18 @@ def deg_to_direction(deg):
     dirs = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
     return dirs[round(deg / 45) % 8]
 
-# ===== Health Advice =====
+# ======= Health Advice =======
 def get_suggestions(condition, pm2_5):
-    if pm2_5 <= 12: status = "Good"
-    elif pm2_5 <= 35: status = "Moderate"
-    elif pm2_5 <= 55: status = "Unhealthy for Sensitive Groups"
-    elif pm2_5 <= 150: status = "Unhealthy"
-    else: status = "Very Unhealthy"
-
+    if pm2_5 <= 12:
+        status = "Good"
+    elif pm2_5 <= 35:
+        status = "Moderate"
+    elif pm2_5 <= 55:
+        status = "Unhealthy for Sensitive Groups"
+    elif pm2_5 <= 150:
+        status = "Unhealthy"
+    else:
+        status = "Very Unhealthy"
     recs = {
         "Asthma": "Carry inhaler, avoid exertion, wear a mask.",
         "Heart Disease": "Avoid exercise, stay indoors, wear a mask.",
@@ -98,30 +104,45 @@ def get_suggestions(condition, pm2_5):
     }
     return status, recs.get(condition, "Avoid pollution exposure.")
 
-def chatbot_response(msg, condition, pm2_5):
-    msg = msg.lower()
-    base = "✅ Air is okay." if pm2_5 <= 35 else (
-        "⚠️ Moderate air. Sensitive groups, be cautious." if pm2_5 <= 55 else "🚫 Unhealthy air. Avoid going out.")
+# ======= Interactive Chatbot =======
+def chatbot_response(user_msg, condition, pm2_5, city):
+    user_msg = user_msg.lower()
+
+    # Air quality status
+    if pm2_5 <= 12:
+        level, emoji = "Good", "✅"
+    elif pm2_5 <= 35:
+        level, emoji = "Moderate", "⚠️"
+    elif pm2_5 <= 55:
+        level, emoji = "Unhealthy (Sensitive)", "🚩"
+    else:
+        level, emoji = "Unhealthy", "🚫"
+
     recs = {
-        "Asthma": "Use inhaler, stay indoors, wear a mask.",
-        "Heart Disease": "Avoid exertion outdoors, stay cool, wear a mask.",
-        "Children": "Limit outdoor activity.",
-        "Elderly": "Avoid pollution and stay hydrated.",
-        "Healthy": "Use mask and avoid long outdoor exposure."
+        "asthma": "Carry your inhaler and avoid outdoor exposure.",
+        "heart disease": "Stay indoors, avoid exertion.",
+        "children": "Indoor play is best today.",
+        "elderly": "Stay hydrated and limit outdoor movement.",
+        "healthy": "Outdoor activity okay but avoid pollution-heavy areas."
     }
-    if any(k in msg for k in ["hi", "hello", "hey"]):
-        return f"👋 Hello! I'm your air quality bot. You selected '{condition}'. Ask away!"
-    if any(k in msg for k in ["safe", "okay", "go out"]):
-        return f"{base} Advice for {condition}: {recs.get(condition)}"
-    if any(k in msg for k in ["precaution", "do", "mask"]):
-        return f"😷 For {condition}: {recs.get(condition)}"
-    return "🤖 Ask if it's safe to go out, or what precautions to take!"
 
-# ===== Streamlit UI =====
-st.set_page_config("🌤️ Air Quality & Weather Advisor", layout="wide")
-st.title("🌍 Smart Air Quality & Weather Assistant")
+    if "hi" in user_msg or "hello" in user_msg:
+        return f"👋 Hi there! Air quality in **{city}** is currently **{level} {emoji}**.\nHow can I assist you today?"
 
-city = st.text_input("Enter a city name:")
+    elif "can i go" in user_msg or "safe" in user_msg or "outside" in user_msg:
+        if pm2_5 <= 35:
+            return f"✅ Yes, it's safe to go outside in **{city}**. Air quality is **{level}**.\nAdvice for {condition}: {recs[condition.lower()]}"
+        else:
+            return f"🚫 Air is **{level}** in **{city}**. Best to limit outdoor exposure.\nAdvice for {condition}: {recs[condition.lower()]}"
+
+    elif "precaution" in user_msg or "what should i do" in user_msg or "mask" in user_msg:
+        return f"😷 For {condition}: {recs[condition.lower()]}\nCurrent AQI: **{level} {emoji}**."
+
+    else:
+        return f"🤖 I can help with air safety and precautions.\nTry asking: 'Is it safe to go outside?' or 'What should I do?'"
+
+# ======= Streamlit UI =======
+city = st.text_input("🏙️ Enter a city name:")
 health_condition = st.selectbox("Select your health condition:", ["Healthy", "Asthma", "Heart Disease", "Children", "Elderly"])
 
 if city:
@@ -142,17 +163,14 @@ if city:
             folium.Marker([lat, lon], tooltip=city).add_to(m)
             folium_static(m)
 
-        st.subheader("📊 AQI Forecast (PM2.5, PM10, SO₂, NO₂)")
+        st.subheader("📊 AQI Forecast")
         aqi_df = get_air_quality(lat, lon)
         if not aqi_df.empty:
             aqi_df = aqi_df.set_index("datetime").resample("D").mean().reset_index()
             past_df = aqi_df.tail(7).copy()
 
-            st.markdown("### 🔮 AQI Forecast")
-            if model_loaded:
-                future_df = predict_future(past_df)
-            else:
-                future_df = predict_future_fallback(past_df)
+            model, scaler = train_lstm_model(past_df)
+            future_df = predict_future(model, past_df)
 
             full_df = pd.concat([past_df.set_index("datetime")[["pm2_5", "pm10", "so2", "no2"]],
                                  future_df.rename_axis("datetime")])
@@ -164,7 +182,7 @@ if city:
             st.success(f"**Predicted Air Quality:** {status}\n\n**Advice for {health_condition}:** {message}")
 
         st.subheader("🤖 Chatbot Assistant")
-        st.markdown("Ask me something like:\n- Is it safe to go outside today?\n- What precautions should I take?\n- Do I need a mask?")
-        user_msg = st.text_input("Your question:")
+        user_msg = st.text_input("💬 Ask something about air safety (e.g., 'Can I go outside?')")
         if user_msg:
-            st.write(chatbot_response(user_msg, health_condition, latest_pm2_5))
+            st.write(chatbot_response(user_msg, health_condition, latest_pm2_5, city))
+
